@@ -613,3 +613,15 @@ func (b *Bslack) handleSlackEvents(w http.ResponseWriter, r *http.Request) {
 
     w.WriteHeader(http.StatusOK)
 }
+
+type SlackEventWrapper struct {
+    Type      string `json:"type"`
+    Challenge string `json:"challenge,omitempty"`
+    Event     struct {
+        Type    string `json:"type"`
+        User    string `json:"user"`
+        Text    string `json:"text"`
+        Channel string `json:"channel"`
+        Ts      string `json:"ts"`
+    } `json:"event"`
+}
