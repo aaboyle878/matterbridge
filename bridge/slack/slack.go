@@ -23,8 +23,6 @@ type Bslack struct {
 
 	mh  *matterhook.Client
 	sc  *slack.Client
-	rtm *slack.RTM
-	si  *slack.Info
 
 	cache        *lru.Cache
 	uuid         string
@@ -33,6 +31,8 @@ type Bslack struct {
 	channels *channels
 	users    *users
 	legacy   bool
+
+	eventserver *http.Server
 }
 
 const (
@@ -114,10 +114,25 @@ func (b *Bslack) Connect() error {
 		b.channels = newChannelManager(b.Log, b.sc)
 		b.users = newUserManager(b.Log, b.sc)
 
+		mux := http.NewServeMux()
+		mux.HandleFunc("/slack/events", b.handleSlackEvents) // we'll define this function next
+
+		b.eventServer = &http.Server{
+			Addr:    ":8080", // you can make this configurable
+			Handler: mux,
+		}
+
+		go func() {
+			if err := b.eventServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				b.Log.Errorf("Slack event server error: %v", err)
+			}
+		}()
+
+		/*
 		b.rtm = b.sc.NewRTM()
 		go b.rtm.ManageConnection()
 		go b.handleSlack()
-		return nil
+		return nil */
 	}
 
 	// In absence of a token we fall back to incoming and outgoing Webhooks.
@@ -142,7 +157,10 @@ func (b *Bslack) Connect() error {
 }
 
 func (b *Bslack) Disconnect() error {
-	return b.rtm.Disconnect()
+	if b.eventServer != nil {
+		return b.eventServer.Close()
+	}
+	return nil
 }
 
 // JoinChannel only acts as a verification method that checks whether Matterbridge's
@@ -208,7 +226,7 @@ func (b *Bslack) Send(msg config.Message) (string, error) {
 	if b.GetString(outgoingWebhookConfig) != "" && b.GetString(tokenConfig) == "" {
 		return "", b.sendWebhook(msg)
 	}
-	return b.sendRTM(msg)
+	return b.sendAPI(msg)
 }
 
 // sendWebhook uses the configured WebhookURL to send the message
@@ -275,7 +293,7 @@ func (b *Bslack) sendWebhook(msg config.Message) error {
 	return nil
 }
 
-func (b *Bslack) sendRTM(msg config.Message) (string, error) {
+func (b *Bslack) sendAPI(msg config.Message) (string, error) {
 	// Handle channelmember messages.
 	if handled := b.handleGetChannelMembers(&msg); handled {
 		return "", nil
@@ -287,7 +305,7 @@ func (b *Bslack) sendRTM(msg config.Message) (string, error) {
 	}
 	if msg.Event == config.EventUserTyping {
 		if b.GetBool("ShowUserTyping") {
-			b.rtm.SendMessage(b.rtm.NewTypingMessage(channelInfo.ID))
+			b.Log.Debug("User typing event received (not supported by Slack Web API)")
 		}
 		return "", nil
 	}
@@ -326,7 +344,7 @@ func (b *Bslack) sendRTM(msg config.Message) (string, error) {
 		for i := range extraMsgs {
 			rmsg := &extraMsgs[i]
 			rmsg.Text = rmsg.Username + rmsg.Text
-			_, err = b.postMessage(rmsg, channelInfo)
+			_, err = b.postAPIMessage(rmsg, channelInfo)
 			if err != nil {
 				b.Log.Error(err)
 			}
@@ -336,32 +354,34 @@ func (b *Bslack) sendRTM(msg config.Message) (string, error) {
 	}
 
 	// Post message.
-	return b.postMessage(&msg, channelInfo)
+	return b.postAPIMessage(&msg, channelInfo)
 }
 
 func (b *Bslack) updateTopicOrPurpose(msg *config.Message, channelInfo *slack.Channel) error {
-	var updateFunc func(channelID string, value string) (*slack.Channel, error)
-
 	incomingChangeType, text := b.extractTopicOrPurpose(msg.Text)
-	switch incomingChangeType {
-	case "topic":
-		updateFunc = b.rtm.SetTopicOfConversation
-	case "purpose":
-		updateFunc = b.rtm.SetPurposeOfConversation
-	default:
-		b.Log.Errorf("Unhandled type received from extractTopicOrPurpose: %s", incomingChangeType)
-		return nil
-	}
+
 	for {
-		_, err := updateFunc(channelInfo.ID, text)
+		var err error
+		switch incomingChangeType {
+		case "topic":
+			_, err = b.sc.SetTopicOfConversation(channelInfo.ID, text)
+		case "purpose":
+			_, err = b.sc.SetPurposeOfConversation(channelInfo.ID, text)
+		default:
+			b.Log.Errorf("Unhandled type received from extractTopicOrPurpose: %s", incomingChangeType)
+			return nil
+		}
+
 		if err == nil {
 			return nil
 		}
+
 		if err = handleRateLimit(b.Log, err); err != nil {
 			return err
 		}
 	}
 }
+
 
 // handles updating topic/purpose and determining whether to further propagate update messages.
 func (b *Bslack) handleTopicOrPurpose(msg *config.Message, channelInfo *slack.Channel) (bool, error) {
@@ -393,7 +413,7 @@ func (b *Bslack) deleteMessage(msg *config.Message, channelInfo *slack.Channel) 
 	}
 
 	for {
-		_, _, err := b.rtm.DeleteMessage(channelInfo.ID, msg.ID)
+		err := b.sc.DeleteMessage(channelInfo.ID, msg.ID)
 		if err == nil {
 			return true, nil
 		}
@@ -411,7 +431,7 @@ func (b *Bslack) editMessage(msg *config.Message, channelInfo *slack.Channel) (b
 	}
 	messageOptions := b.prepareMessageOptions(msg)
 	for {
-		_, _, _, err := b.rtm.UpdateMessage(channelInfo.ID, msg.ID, messageOptions...)
+		_, _, _, err := b.sc.UpdateMessage(channelInfo.ID, msg.ID, messageOptions...)
 		if err == nil {
 			return true, nil
 		}
@@ -423,14 +443,15 @@ func (b *Bslack) editMessage(msg *config.Message, channelInfo *slack.Channel) (b
 	}
 }
 
-func (b *Bslack) postMessage(msg *config.Message, channelInfo *slack.Channel) (string, error) {
+func (b *Bslack) postAPIMessage(msg *config.Message, channelInfo *slack.Channel) (string, error) {
+	
 	// don't post empty messages
 	if msg.Text == "" {
 		return "", nil
 	}
 	messageOptions := b.prepareMessageOptions(msg)
 	for {
-		_, id, err := b.rtm.PostMessage(channelInfo.ID, messageOptions...)
+		_, id, err := b.sc.PostMessage(channelInfo.ID, messageOptions...)
 		if err == nil {
 			return id, nil
 		}
@@ -563,4 +584,32 @@ func extractStringField(data map[string]interface{}, field string) string {
 		}
 	}
 	return ""
+}
+
+func (b *Bslack) handleSlackEvents(w http.ResponseWriter, r *http.Request) {
+    var evt SlackEventWrapper
+    body, _ := io.ReadAll(r.Body)
+    _ = json.Unmarshal(body, &evt)
+
+    if evt.Type == "url_verification" {
+        var challenge struct {
+            Challenge string `json:"challenge"`
+        }
+        _ = json.Unmarshal(body, &challenge)
+        w.Write([]byte(challenge.Challenge))
+        return
+    }
+
+    if evt.Type == "event_callback" && evt.Event.Type == "message" {
+        msg := config.Message{
+            Text:     evt.Event.Text,
+            Channel:  evt.Event.Channel,
+            Username: evt.Event.User,
+            Account:  b.Account,
+            Protocol: "slack",
+        }
+        b.Remote <- msg
+    }
+
+    w.WriteHeader(http.StatusOK)
 }
