@@ -98,20 +98,10 @@ func (b *Bslack) populateMessageWithBotInfo(ev *slack.MessageEvent, rmsg *config
 		return nil
 	}
 
-	var err error
-	var bot *slack.Bot
-	for {
-		bot, err = b.rtm.GetBotInfo(slack.GetBotInfoParameters{
-			Bot: ev.BotID,
-		})
-		if err == nil {
-			break
-		}
-
-		if err = handleRateLimit(b.Log, err); err != nil {
-			b.Log.Errorf("Could not retrieve bot information: %#v", err)
-			return err
-		}
+	bot, err := b.sc.GetBotInfo(ev.BotID)
+	if err != nil {
+		b.Log.Errorf("Could not retrieve bot information for ID %s: %v", ev.BotID, err)
+		return err
 	}
 	b.Log.Debugf("Found bot %#v", bot)
 

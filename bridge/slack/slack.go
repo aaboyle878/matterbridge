@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"net/http"
 
 	"github.com/42wim/matterbridge/bridge"
 	"github.com/42wim/matterbridge/bridge/config"
@@ -72,10 +73,7 @@ func New(cfg *bridge.Config) bridge.Bridger {
 	// Print a deprecation warning for legacy non-bot tokens (#527).
 	token := cfg.GetString(tokenConfig)
 	if token != "" && !strings.HasPrefix(token, "xoxb") {
-		cfg.Log.Warn("Non-bot token detected. It is STRONGLY recommended to use a proper bot-token instead.")
-		cfg.Log.Warn("Legacy tokens may be deprecated by Slack at short notice. See the Matterbridge GitHub wiki for a migration guide.")
-		cfg.Log.Warn("See https://github.com/42wim/matterbridge/wiki/Slack-bot-setup")
-		return NewLegacy(cfg)
+		cfg.Log.Fatalf("Legacy user tokens are no longer supported. Please use a bot token (xoxb-...).")
 	}
 	return newBridge(cfg)
 }

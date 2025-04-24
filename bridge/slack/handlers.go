@@ -20,8 +20,7 @@ func (b *Bslack) handleSlack() {
 		b.Log.Debugf("Choosing webhooks based receiving")
 		go b.handleMatterHook(messages)
 	} else {
-		b.Log.Debugf("Choosing token based receiving")
-		go b.handleSlackClient(messages)
+		b.Log.Debugf("Slack is using the Web API + Events. Messages will be received via /slack/events")
 	}
 	time.Sleep(time.Second)
 	b.Log.Debug("Start listening for Slack messages")
@@ -47,69 +46,6 @@ func (b *Bslack) handleSlack() {
 	}
 }
 
-func (b *Bslack) handleSlackClient(messages chan *config.Message) {
-	for msg := range b.rtm.IncomingEvents {
-		if msg.Type != sUserTyping && msg.Type != sHello && msg.Type != sLatencyReport {
-			b.Log.Debugf("== Receiving event %#v", msg.Data)
-		}
-		switch ev := msg.Data.(type) {
-		case *slack.UserTypingEvent:
-			if !b.GetBool("ShowUserTyping") {
-				continue
-			}
-			rmsg, err := b.handleTypingEvent(ev)
-			if err == ErrEventIgnored {
-				continue
-			} else if err != nil {
-				b.Log.Errorf("%#v", err)
-				continue
-			}
-
-			messages <- rmsg
-		case *slack.MessageEvent:
-			if b.skipMessageEvent(ev) {
-				b.Log.Debugf("Skipped message: %#v", ev)
-				continue
-			}
-			rmsg, err := b.handleMessageEvent(ev)
-			if err != nil {
-				b.Log.Errorf("%#v", err)
-				continue
-			}
-			messages <- rmsg
-		case *slack.FileDeletedEvent:
-			rmsg, err := b.handleFileDeletedEvent(ev)
-			if err != nil {
-				b.Log.Printf("%#v", err)
-				continue
-			}
-			messages <- rmsg
-		case *slack.OutgoingErrorEvent:
-			b.Log.Debugf("%#v", ev.Error())
-		case *slack.ChannelJoinedEvent:
-			// When we join a channel we update the full list of users as
-			// well as the information for the channel that we joined as this
-			// should now tell that we are a member of it.
-			b.channels.registerChannel(ev.Channel)
-		case *slack.ConnectedEvent:
-			b.si = ev.Info
-			b.channels.populateChannels(true)
-			b.users.populateUsers(true)
-		case *slack.InvalidAuthEvent:
-			b.Log.Fatalf("Invalid Token %#v", ev)
-		case *slack.ConnectionErrorEvent:
-			b.Log.Errorf("Connection failed %#v %#v", ev.Error(), ev.ErrorObj)
-		case *slack.MemberJoinedChannelEvent:
-			b.users.populateUser(ev.User)
-		case *slack.HelloEvent, *slack.LatencyReport, *slack.ConnectingEvent:
-			continue
-		case *slack.UserChangeEvent:
-			b.users.invalidateUser(ev.User.ID)
-		default:
-			b.Log.Debugf("Unhandled incoming event: %T", ev)
-		}
-	}
-}
 
 func (b *Bslack) handleMatterHook(messages chan *config.Message) {
 	for {
@@ -166,8 +102,7 @@ func (b *Bslack) skipMessageEvent(ev *slack.MessageEvent) bool {
 	}
 
 	// Skip any messages that we made ourselves or from 'slackbot' (see #527).
-	if ev.Username == sSlackBotUser ||
-		(b.rtm != nil && ev.Username == b.si.User.Name) || hasOurCallbackID {
+	if ev.Username == sSlackBotUser || hasOurCallbackID {
 		return true
 	}
 
@@ -328,9 +263,6 @@ func (b *Bslack) handleAttachments(ev *slack.MessageEvent, rmsg *config.Message)
 }
 
 func (b *Bslack) handleTypingEvent(ev *slack.UserTypingEvent) (*config.Message, error) {
-	if ev.User == b.si.User.ID {
-		return nil, ErrEventIgnored
-	}
 	channelInfo, err := b.channels.getChannelByID(ev.Channel)
 	if err != nil {
 		return nil, err
