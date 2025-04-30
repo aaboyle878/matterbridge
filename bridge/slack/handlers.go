@@ -71,7 +71,7 @@ func (b *Bslack) skipMessageEvent(ev *slack.MessageEvent) bool {
 		return true
 	case sChannelTopic, sChannelPurpose:
 		// Skip the event if our bot/user account changed the topic/purpose
-		if ev.User == b.si.User.ID {
+		if ev.User == "" || ev.User == sSlackBotUser {
 			return true
 		}
 	}

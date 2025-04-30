@@ -2,12 +2,14 @@ package bslack
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
-	"net/http"
 
 	"github.com/42wim/matterbridge/bridge"
 	"github.com/42wim/matterbridge/bridge/config"
@@ -22,18 +24,17 @@ type Bslack struct {
 	sync.RWMutex
 	*bridge.Config
 
-	mh  *matterhook.Client
-	sc  *slack.Client
+	mh *matterhook.Client
+	sc *slack.Client
 
 	cache        *lru.Cache
 	uuid         string
 	useChannelID bool
+	eventServer  *http.Server
 
 	channels *channels
 	users    *users
 	legacy   bool
-
-	eventserver *http.Server
 }
 
 const (
@@ -57,7 +58,7 @@ const (
 	sSlackBotUser        = "slackbot"
 	cfileDownloadChannel = "file_download_channel"
 
-	tokenConfig           = "Token"
+	tokenConfig           = "TokenBot"
 	incomingWebhookConfig = "WebhookBindAddress"
 	outgoingWebhookConfig = "WebhookURL"
 	skipTLSConfig         = "SkipTLSVerify"
@@ -104,7 +105,11 @@ func (b *Bslack) Connect() error {
 	}
 
 	// If we have a token we use the Slack websocket-based RTM for both sending and receiving.
-	if token := b.GetString(tokenConfig); token != "" {
+	token := b.GetString("TokenBot")
+	if token == "" {
+		token = b.GetString(tokenConfig)
+	}
+	if token != "" {
 		b.Log.Info("Connecting using token")
 
 		b.sc = slack.New(token, slack.OptionDebug(b.GetBool("Debug")))
@@ -116,7 +121,7 @@ func (b *Bslack) Connect() error {
 		mux.HandleFunc("/slack/events", b.handleSlackEvents) // we'll define this function next
 
 		b.eventServer = &http.Server{
-			Addr:    ":8080", // you can make this configurable
+			Addr:    ":3000", // you can make this configurable
 			Handler: mux,
 		}
 
@@ -127,10 +132,10 @@ func (b *Bslack) Connect() error {
 		}()
 
 		/*
-		b.rtm = b.sc.NewRTM()
-		go b.rtm.ManageConnection()
-		go b.handleSlack()
-		return nil */
+			b.rtm = b.sc.NewRTM()
+			go b.rtm.ManageConnection()
+			go b.handleSlack()
+			return nil */
 	}
 
 	// In absence of a token we fall back to incoming and outgoing Webhooks.
@@ -380,7 +385,6 @@ func (b *Bslack) updateTopicOrPurpose(msg *config.Message, channelInfo *slack.Ch
 	}
 }
 
-
 // handles updating topic/purpose and determining whether to further propagate update messages.
 func (b *Bslack) handleTopicOrPurpose(msg *config.Message, channelInfo *slack.Channel) (bool, error) {
 	if msg.Event != config.EventTopicChange {
@@ -411,7 +415,7 @@ func (b *Bslack) deleteMessage(msg *config.Message, channelInfo *slack.Channel) 
 	}
 
 	for {
-		err := b.sc.DeleteMessage(channelInfo.ID, msg.ID)
+		_, _, err := b.sc.DeleteMessage(channelInfo.ID, msg.ID)
 		if err == nil {
 			return true, nil
 		}
@@ -442,7 +446,7 @@ func (b *Bslack) editMessage(msg *config.Message, channelInfo *slack.Channel) (b
 }
 
 func (b *Bslack) postAPIMessage(msg *config.Message, channelInfo *slack.Channel) (string, error) {
-	
+
 	// don't post empty messages
 	if msg.Text == "" {
 		return "", nil
@@ -585,41 +589,71 @@ func extractStringField(data map[string]interface{}, field string) string {
 }
 
 func (b *Bslack) handleSlackEvents(w http.ResponseWriter, r *http.Request) {
-    var evt SlackEventWrapper
-    body, _ := io.ReadAll(r.Body)
-    _ = json.Unmarshal(body, &evt)
+	var evt SlackEventWrapper
+	body, _ := io.ReadAll(r.Body)
+	b.Log.Infof("Received raw Slack event: %s", string(body))
+	_ = json.Unmarshal(body, &evt)
 
-    if evt.Type == "url_verification" {
-        var challenge struct {
-            Challenge string `json:"challenge"`
-        }
-        _ = json.Unmarshal(body, &challenge)
-        w.Write([]byte(challenge.Challenge))
-        return
-    }
+	if evt.Type == "url_verification" {
+		var challenge struct {
+			Challenge string `json:"challenge"`
+		}
+		if err := json.Unmarshal(body, &challenge); err != nil {
+			b.Log.Errorf("Could not parse challenge: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]string{"challenge": challenge.Challenge}
+		json.NewEncoder(w).Encode(resp)
+		return
+	}
 
-    if evt.Type == "event_callback" && evt.Event.Type == "message" {
-        msg := config.Message{
-            Text:     evt.Event.Text,
-            Channel:  evt.Event.Channel,
-            Username: evt.Event.User,
-            Account:  b.Account,
-            Protocol: "slack",
-        }
-        b.Remote <- msg
-    }
+	if evt.Type == "event_callback" && evt.Event.Type == "message" && evt.Event.SubType != "bot_message" {
+		channel, err := b.channels.getChannelByID(evt.Event.Channel)
+		if err != nil {
+			b.Log.Errorf("Could not get channel name for ID %s: %v", evt.Event.Channel, err)
+			return
+		}
+		username := evt.Event.User // fallback to ID if needed
+		if evt.Event.User != "" {
+			userInfo, err := b.sc.GetUserInfo(evt.Event.User)
+			if err != nil {
+				b.Log.Warnf("Could not fetch username for user ID %s: %v", evt.Event.User, err)
+			} else if userInfo.Profile.DisplayName != "" {
+				username = userInfo.Profile.DisplayName
+			}
+		}
 
-    w.WriteHeader(http.StatusOK)
+		msg := config.Message{
+			Text:     evt.Event.Text,
+			Channel:  channel.Name,
+			Username: username,
+			Account:  b.Account,
+			Protocol: "slack",
+		}
+		b.Log.Infof("Relaying Slack message from user %s in channel %s", msg.Username, channel.Name)
+		b.Remote <- msg
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 type SlackEventWrapper struct {
-    Type      string `json:"type"`
-    Challenge string `json:"challenge,omitempty"`
-    Event     struct {
-        Type    string `json:"type"`
-        User    string `json:"user"`
-        Text    string `json:"text"`
-        Channel string `json:"channel"`
-        Ts      string `json:"ts"`
-    } `json:"event"`
+	Type      string `json:"type"`
+	Challenge string `json:"challenge,omitempty"`
+	Event     struct {
+		Type            string `json:"type"`
+		SubType         string `json:"subtype,omitempty"` // <--- Add this
+		User            string `json:"user,omitempty"`
+		Text            string `json:"text,omitempty"`
+		Channel         string `json:"channel"`
+		Ts              string `json:"ts"`
+		DeletedTs       string `json:"deleted_ts,omitempty"` // <--- Add this
+		PreviousMessage struct {
+			Ts   string `json:"ts"`
+			User string `json:"user"`
+			Text string `json:"text"`
+		} `json:"previous_message,omitempty"`
+	} `json:"event"`
 }

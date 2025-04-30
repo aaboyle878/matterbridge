@@ -1,0 +1,21 @@
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+COPY . .
+
+# Download deps
+RUN go mod tidy
+
+# Build matterbridge binary
+RUN go build -o matterbridge .
+
+# Final image
+FROM alpine:latest
+
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /app
+COPY --from=builder /app/matterbridge /app/matterbridge
+COPY matterbridge.toml /app/matterbridge.toml
+
+ENTRYPOINT ["/app/matterbridge"]

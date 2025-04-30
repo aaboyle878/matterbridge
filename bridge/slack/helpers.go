@@ -98,7 +98,7 @@ func (b *Bslack) populateMessageWithBotInfo(ev *slack.MessageEvent, rmsg *config
 		return nil
 	}
 
-	bot, err := b.sc.GetBotInfo(ev.BotID)
+	bot, err := b.sc.GetBotInfo(slack.GetBotInfoParameters{Bot: ev.BotID})
 	if err != nil {
 		b.Log.Errorf("Could not retrieve bot information for ID %s: %v", ev.BotID, err)
 		return err

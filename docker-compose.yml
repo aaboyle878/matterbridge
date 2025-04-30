@@ -1,0 +1,14 @@
+services:
+  matterbridge:
+    build:
+      context: .
+      dockerfile: dockerfile.local
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    volumes:
+    - ./matterbridge.toml:/etc/matterbridge/matterbridge.toml:ro
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    command: -debug

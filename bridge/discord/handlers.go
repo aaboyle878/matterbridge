@@ -108,6 +108,10 @@ func (b *Bdiscord) messageCreate(s *discordgo.Session, m *discordgo.MessageCreat
 	rmsg := config.Message{Account: b.Account, Avatar: "https://cdn.discordapp.com/avatars/" + m.Author.ID + "/" + m.Author.Avatar + ".jpg", UserID: m.Author.ID, ID: m.ID}
 
 	b.Log.Debugf("== Receiving event %#v", m.Message)
+	if m.WebhookID != "" {
+		b.Log.Debugf("Ignoring message from webhook ID %s", m.WebhookID)
+		return
+	}
 
 	if m.Content != "" {
 		m.Message.Content = b.replaceChannelMentions(m.Message.Content)
@@ -120,6 +124,9 @@ func (b *Bdiscord) messageCreate(s *discordgo.Session, m *discordgo.MessageCreat
 
 	// set channel name
 	rmsg.Channel = b.getChannelName(m.ChannelID)
+	if rmsg.Channel == "" {
+		b.Log.Warnf("Channel ID %s does not map to a known channel name", m.ChannelID)
+	}
 
 	fromWebhook := m.WebhookID != ""
 	if !fromWebhook && !b.GetBool("UseUserName") {
